@@ -202,10 +202,10 @@ def write_device_files(sn: str, config: dict, zam_server: str = "192.168.1.100")
 
 if __name__ == "__main__":
     example_config = {
-        "hostname": "C03SW1",
+        "hostname": "SW1",
         "vlans": [
             {"id": 1, "name": "Network_MGMT"},
-            {"id": 396, "name": "WiFi7-MC1"},
+            {"id": 396, "name": "WiFi"},
         ],
         "trunk_ports": [
             {
