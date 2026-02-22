@@ -1,0 +1,11 @@
+# ZAM v2 Provisioner Configuration
+# This file is optional - environment variables take precedence
+
+[server]
+# HTTP API settings
+http_host = 0.0.0.0
+http_port = 8000
+
+# TFTP server settings  
+tftp_host = 0.0.0.0
+tftp_port = 69

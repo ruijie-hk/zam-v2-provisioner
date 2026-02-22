@@ -14,12 +14,15 @@ import time
 import logging
 from datetime import datetime
 
-# Configuration - UPDATE THESE FOR YOUR ENVIRONMENT
-ZAM_SERVER = "192.168.1.100"  # Your provisioner IP
-ZAM_API_PORT = "8000"
-TFTP_SERVER = ZAM_SERVER
+# Configuration - read from environment with fallbacks
+ZAM_SERVER = os.environ.get("ZAM_SERVER", "192.168.1.100")
+ZAM_API_PORT = os.environ.get("ZAM_API_PORT", "8000")
+TFTP_SERVER = os.environ.get("TFTP_SERVER", ZAM_SERVER)
+LOG_FILE = os.environ.get("ZAM_LOG_FILE", "/flash/zam.log")
 
-LOG_FILE = "/flash/zam.log"
+# Retry configuration
+MAX_RETRIES = int(os.environ.get("ZAM_MAX_RETRIES", "5"))
+RETRY_DELAY_BASE = int(os.environ.get("ZAM_RETRY_DELAY", "5"))
 
 def log(msg):
     """Simple logging"""
@@ -80,20 +83,37 @@ def execute_cli(cmd):
         log(f"CLI error: {e}")
         return ""
 
-def http_request(url, data=None, method="GET"):
-    """Make HTTP request to provisioner"""
-    try:
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(data).encode() if data else None,
-            headers={"Content-Type": "application/json"},
-            method=method
-        )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read().decode())
-    except Exception as e:
-        log(f"HTTP error: {e}")
-        return None
+def http_request(url, data=None, method="GET", max_retries=None):
+    """Make HTTP request to provisioner with retry logic"""
+    max_retries = max_retries or MAX_RETRIES
+    delay = RETRY_DELAY_BASE
+    
+    for attempt in range(max_retries):
+        try:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(data).encode() if data else None,
+                headers={"Content-Type": "application/json"},
+                method=method
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            # HTTP errors (4xx, 5xx) - do not retry 4xx
+            if 400 <= e.code < 500:
+                log(f"HTTP error {e.code}: {e.reason}")
+                return None
+            log(f"HTTP {e.code} error (attempt {attempt+1}/{max_retries}): {e.reason}")
+        except Exception as e:
+            log(f"HTTP error (attempt {attempt+1}/{max_retries}): {e}")
+        
+        if attempt < max_retries - 1:
+            log(f"Retrying in {delay}s...")
+            time.sleep(delay)
+            delay *= 2  # Exponential backoff
+    
+    log(f"Max retries ({max_retries}) exceeded for {url}")
+    return None
 
 def register_device(sn, mac, ip):
     """Register device with provisioner"""
@@ -142,8 +162,32 @@ def download_files(files_config, sn):
     return downloaded
 
 def apply_config(cfg_file):
-    """Apply configuration file"""
+    """Apply configuration file with validation"""
     log(f"Applying config from {cfg_file}")
+    
+    # Validate config file before applying
+    if not os.path.exists(cfg_file):
+        log(f"ERROR: Config file does not exist: {cfg_file}")
+        return False
+    
+    try:
+        file_stat = os.stat(cfg_file)
+        if file_stat.st_size == 0:
+            log(f"ERROR: Config file is empty: {cfg_file}")
+            return False
+        
+        with open(cfg_file, 'r') as f:
+            lines = [line.strip() for line in f if line.strip()]
+        
+        min_lines = int(os.environ.get("ZAM_MIN_CONFIG_LINES", "5"))
+        if len(lines) < min_lines:
+            log(f"ERROR: Config file has only {len(lines)} lines, minimum is {min_lines}")
+            return False
+        
+        log(f"Config validation passed: {len(lines)} lines, {file_stat.st_size} bytes")
+    except Exception as e:
+        log(f"ERROR: Failed to validate config file: {e}")
+        return False
     
     try:
         # Copy to startup-config
@@ -239,10 +283,22 @@ def main():
         })
         
         log("Configuration applied successfully")
-        log("Rebooting in 5 seconds...")
-        time.sleep(5)
         
-        # Reboot
+        # Check if user wants to skip auto-reboot (for testing)
+        if os.environ.get("ZAM_SKIP_RELOAD", "").lower() in ("1", "true", "yes"):
+            log("ZAM_SKIP_RELOAD set, skipping reload. Manual reload required.")
+            upload_logs(sn)
+            report_status(deployment_id, "done", {
+                "files_downloaded": len(downloaded),
+                "reboot_scheduled": False,
+                "skip_reload": True
+            })
+            return 0
+        
+        # Otherwise auto-reboot
+        log("Rebooting in 5 seconds...")
+        upload_logs(sn)
+        time.sleep(5)
         execute_cli("reload force")
     else:
         report_status(deployment_id, "failed", {

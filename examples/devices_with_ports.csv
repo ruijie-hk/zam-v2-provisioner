@@ -1,0 +1,6 @@
+sn,mac,ip,template_id,access_ports,trunk_ports,aggregate_ports
+G1NQ7UW700483,00:11:22:33:44:55,10.0.10.51,edge-48p,"Gi0/1:20:Office,Gi0/2:20:Desk,Gi0/3:30:Printer","Gi0/24:1,10,20:Uplink","1:Gi0/4,Gi0/5:trunk:1,10,20:Dist-Uplink"
+G1NQ7UW700484,00:11:22:33:44:56,10.0.10.52,edge-48p,"Gi0/1:10:Reception,Gi0/2:10:Waiting","Gi0/24:1,10,20:Core-Uplink","1:Gi0/3,Gi0/4:trunk:1,10,20:Server-Link;2:Gi0/5,Gi0/6:trunk:30,40:Storage"
+G1NQ7UW700485,00:11:22:33:44:57,10.0.10.53,core-24f,"Fa0/1:50:Server-Mgmt","Te0/1:1,10,20,30,40:Distribution","1:Te0/2,Te0/3:trunk:1,10,20,30,40,50:Core-Ag;2:Gi0/1,Gi0/2:access:99:OOB-Mgmt"
+G1NQ7UW700486,00:11:22:33:44:58,10.0.10.54,edge-48p,"Gi0/1:40:Lab-1,Gi0/2:40:Lab-2,Gi0/3:40:Lab-3",,"1:Gi0/23,Gi0/24:trunk:1,10,20,40:Lab-Uplink:1"
+G1NQ7UW700487,,,edge-48p,"Gi0/1:99:IoT-Sensor",,

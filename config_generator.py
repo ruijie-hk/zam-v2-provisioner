@@ -63,6 +63,30 @@ def generate_ruijie_config(config: dict, sn: str) -> str:
     
     lines.append("")
     
+
+    # Aggregate ports (LACP)
+    aggregate_ports = config.get("aggregate_ports", [])
+    for ag in aggregate_ports:
+        ag_id = ag.get("id", 1)
+
+        # Create aggregate port interface
+        lines.append(f"interface aggregateport {ag_id}")
+        if ag.get("description"):
+            lines.append(f" description {ag['description']}")
+        lines.append(f" switchport mode {ag.get('switchport_mode', 'trunk')}")
+        if ag.get("allowed_vlans"):
+            lines.append(f" switchport trunk allowed vlan {ag['allowed_vlans']}")
+        if ag.get("native_vlan"):
+            lines.append(f" switchport trunk native vlan {ag['native_vlan']}")
+        lines.append("!")
+        lines.append("")
+
+        # Add member ports with port-group assignment
+        for member in ag.get("members", []):
+            lines.append(f"interface {member}")
+            lines.append(f" port-group {ag_id}")
+            lines.append("!")
+            lines.append("")
     # SNMP
     if config.get("snmp"):
         snmp = config["snmp"]

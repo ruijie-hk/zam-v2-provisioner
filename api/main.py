@@ -10,6 +10,12 @@ import yaml
 
 app = FastAPI(title="ZAM v2 Provisioner")
 
+# Health check endpoint
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for monitoring and startup verification"""
+    return {"status": "ok"}
+
 # Pydantic models
 class DeviceRegister(BaseModel):
     sn: str
@@ -207,9 +213,234 @@ def get_template(id: str, db: Session = Depends(get_db)):
 
 
 # CSV Import
+def parse_access_ports(value: str) -> List[Dict[str, Any]]:
+    """
+    Parse access_ports column: "port:vlan:desc,port:vlan:desc"
+    Example: "Gi0/1:20:Office,Gi0/2:30:Desk"
+    Returns: [{"interface": "GigabitEthernet 0/1", "vlan": 20, "description": "Office"}, ...]
+    """
+    if not value or not value.strip():
+        return []
+    
+    result = []
+    for entry in value.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        
+        parts = entry.split(":")
+        if len(parts) < 2:
+            continue
+        
+        port_raw = parts[0].strip()
+        vlan_str = parts[1].strip()
+        desc = parts[2].strip() if len(parts) > 2 else ""
+        
+        # Expand port shorthand (Gi0/1 -> GigabitEthernet 0/1)
+        interface = expand_port_name(port_raw)
+        
+        try:
+            vlan = int(vlan_str)
+        except ValueError:
+            continue  # Skip invalid vlan
+        
+        port_config = {"interface": interface, "vlan": vlan}
+        if desc:
+            port_config["description"] = desc
+        result.append(port_config)
+    
+    return result
+
+
+def parse_trunk_ports(value: str) -> List[Dict[str, Any]]:
+    """
+    Parse trunk_ports column: "port:vlans:desc;port:vlans:desc"
+    vlans is comma-separated list of VLAN IDs
+    Use semicolons to separate port entries, commas for VLAN lists
+    Example: "Gi0/24:1,10,20:Uplink;Gi0/23:10,20,30:Server"
+    Returns: [{"interface": "GigabitEthernet 0/24", "allowed_vlans": "1,10,20", "description": "Uplink"}, ...]
+    """
+    if not value or not value.strip():
+        return []
+    
+    result = []
+    # Use semicolon as entry separator to allow commas in VLAN lists
+    for entry in value.split(";"):
+        entry = entry.strip()
+        if not entry:
+            continue
+        
+        # Format: port:vlans:desc where vlans can be "1,10,20"
+        # Find first colon (port) and last colon (optional desc)
+        first_colon = entry.find(":")
+        if first_colon == -1:
+            continue
+        
+        port_raw = entry[:first_colon].strip()
+        remaining = entry[first_colon + 1:]
+        
+        # Find the last colon for description (if any)
+        last_colon = remaining.rfind(":")
+        if last_colon == -1:
+            # No description, everything after port is vlans
+            vlans_str = remaining.strip()
+            desc = ""
+        else:
+            # Check if what's after last colon looks like a VLAN list or description
+            potential_desc = remaining[last_colon + 1:].strip()
+            potential_vlans = remaining[:last_colon].strip()
+            
+            # If the "potential desc" contains only digits and commas, it's part of vlans
+            if potential_desc and all(c.isdigit() or c == "," for c in potential_desc):
+                vlans_str = potential_vlans + "," + potential_desc if potential_vlans else potential_desc
+                desc = ""
+            else:
+                vlans_str = potential_vlans
+                desc = potential_desc
+        
+        # Validate vlans (should be comma-separated digits)
+        if not vlans_str or not all(c.isdigit() or c == "," for c in vlans_str):
+            continue
+        
+        interface = expand_port_name(port_raw)
+        
+        port_config = {"interface": interface, "allowed_vlans": vlans_str}
+        if desc:
+            port_config["description"] = desc
+        result.append(port_config)
+    
+    return result
+
+
+def parse_aggregate_ports(value: str) -> List[Dict[str, Any]]:
+    """
+    Parse aggregate_ports column: "id:members:mode:vlans:desc;id:members:mode:vlans:desc"
+    
+    Format for each aggregate port: "id:member1,member2:mode:vlans:description[:native_vlan]"
+    - id: aggregate port ID (integer)
+    - members: comma-separated list of member ports
+    - mode: switchport mode (trunk or access)
+    - vlans: allowed VLANs (comma-separated)
+    - description: optional description
+    - native_vlan: optional native VLAN (only for trunk mode)
+    
+    Use semicolons to separate multiple aggregate ports.
+    
+    Example: "1:Gi0/1,Gi0/2:trunk:1,10,20:Uplink;2:Gi0/3,Gi0/4:access:30:Server"
+    
+    Returns: [
+        {
+            "id": 1,
+            "members": ["GigabitEthernet 0/1", "GigabitEthernet 0/2"],
+            "switchport_mode": "trunk",
+            "allowed_vlans": "1,10,20",
+            "description": "Uplink"
+        },
+        ...
+    ]
+    """
+    if not value or not value.strip():
+        return []
+    
+    result = []
+    # Use semicolon as entry separator
+    for entry in value.split(";"):
+        entry = entry.strip()
+        if not entry:
+            continue
+        
+        parts = entry.split(":")
+        if len(parts) < 4:
+            continue  # Need at least id, members, mode, vlans
+        
+        try:
+            ag_id = int(parts[0].strip())
+        except ValueError:
+            continue  # Skip invalid ID
+        
+        members_raw = parts[1].strip()
+        mode = parts[2].strip().lower()
+        vlans = parts[3].strip()
+        
+        # Validate mode
+        if mode not in ("trunk", "access"):
+            continue
+        
+        # Parse members (comma-separated)
+        members = [expand_port_name(m.strip()) for m in members_raw.split(",") if m.strip()]
+        if not members:
+            continue
+        
+        ag_config = {
+            "id": ag_id,
+            "members": members,
+            "switchport_mode": mode,
+            "allowed_vlans": vlans
+        }
+        
+        # Optional description (position 4)
+        if len(parts) > 4:
+            desc = parts[4].strip()
+            if desc:
+                ag_config["description"] = desc
+        
+        # Optional native_vlan (position 5, only for trunk)
+        if len(parts) > 5 and mode == "trunk":
+            try:
+                native_vlan = int(parts[5].strip())
+                ag_config["native_vlan"] = native_vlan
+            except ValueError:
+                pass
+        
+        result.append(ag_config)
+    
+    return result
+
+
+def expand_port_name(shorthand: str) -> str:
+    """
+    Expand port shorthand to full interface name.
+    Gi0/1 -> GigabitEthernet 0/1
+    Fa0/1 -> FastEthernet 0/1
+    Te0/1 -> TenGigabitEthernet 0/1
+    """
+    shorthand = shorthand.strip()
+    
+    # Map of prefixes to full names
+    prefixes = {
+        "Gi": "GigabitEthernet",
+        "Fa": "FastEthernet",
+        "Te": "TenGigabitEthernet",
+        "Fo": "FortyGigabitEthernet",
+        "Hu": "HundredGigabitEthernet",
+        "Eth": "Ethernet",
+    }
+    
+    for prefix, full_name in prefixes.items():
+        if shorthand.startswith(prefix):
+            rest = shorthand[len(prefix):]
+            return f"{full_name} {rest}"
+    
+    # If no prefix matched, return as-is (might already be full name)
+    return shorthand
+
+
 @app.post("/admin/csv/upload")
 async def upload_csv(file: UploadFile = File(...), db: Session = Depends(get_db)):
-    """Bulk import: sn,mac,ip,template_id"""
+    """
+    Bulk import with optional port configuration.
+    
+    Required columns: sn
+    Optional columns: mac, ip, template_id, access_ports, trunk_ports, aggregate_ports
+    
+    Port column formats:
+    - access_ports: "port:vlan:desc,port:vlan:desc" (e.g., "Gi0/1:20:Office,Gi0/2:30")
+    - trunk_ports: "port:vlans:desc" (e.g., "Gi0/24:1,10,20:Uplink")
+    - aggregate_ports: "id:members:mode:vlans:desc[:native_vlan];..."
+      (e.g., "1:Gi0/1,Gi0/2:trunk:1,10,20:Uplink")
+    
+    Port shorthand supported: Gi, Fa, Te, Fo, Hu, Eth
+    """
     import csv
     from io import StringIO
     
@@ -218,22 +449,81 @@ async def upload_csv(file: UploadFile = File(...), db: Session = Depends(get_db)
     
     reader = csv.DictReader(StringIO(text))
     imported = 0
+    updated = 0
+    port_configs_applied = 0
+    warnings = []
     
-    for row in reader:
-        sn = row.get("sn")
+    for row_num, row in enumerate(reader, start=2):  # Start at 2 (header is row 1)
+        sn = row.get("sn", "").strip()
         if not sn:
+            warnings.append(f"Row {row_num}: Missing serial number, skipping")
             continue
         
+        # Create or update device
         device = db.query(Device).filter(Device.sn == sn).first()
-        if not device:
+        is_new = device is None
+        
+        if is_new:
             device = Device(
                 sn=sn,
-                mac=row.get("mac"),
-                ip=row.get("ip"),
-                template_id=row.get("template_id")
+                mac=row.get("mac", "").strip() or None,
+                ip=row.get("ip", "").strip() or None,
+                template_id=row.get("template_id", "").strip() or None
             )
             db.add(device)
             imported += 1
+        else:
+            # Update existing device
+            if row.get("mac", "").strip():
+                device.mac = row.get("mac", "").strip()
+            if row.get("ip", "").strip():
+                device.ip = row.get("ip", "").strip()
+            if row.get("template_id", "").strip():
+                device.template_id = row.get("template_id", "").strip()
+            updated += 1
+        
+        # Parse port configuration
+        access_ports_raw = row.get("access_ports", "")
+        trunk_ports_raw = row.get("trunk_ports", "")
+        aggregate_ports_raw = row.get("aggregate_ports", "")
+        aggregate_ports_raw = row.get("aggregate_ports", "")
+        
+        access_ports = parse_access_ports(access_ports_raw)
+        trunk_ports = parse_trunk_ports(trunk_ports_raw)
+        aggregate_ports = parse_aggregate_ports(aggregate_ports_raw)
+        
+        # Create or update DeviceOverride if ports specified
+        if access_ports or trunk_ports or aggregate_ports:
+            override_config = {}
+            if access_ports:
+                override_config["access_ports"] = access_ports
+            if trunk_ports:
+                override_config["trunk_ports"] = trunk_ports
+            if aggregate_ports:
+                override_config["aggregate_ports"] = aggregate_ports
+            
+            override = db.query(DeviceOverride).filter(DeviceOverride.sn == sn).first()
+            if override:
+                # Merge with existing override config
+                existing = dict(override.config) if override.config else {}
+                existing.update(override_config)
+                override.config = existing
+                override.updated_at = datetime.utcnow()
+            else:
+                override = DeviceOverride(sn=sn, config=override_config)
+                db.add(override)
+            
+            port_configs_applied += 1
     
     db.commit()
-    return {"imported": imported}
+    
+    result = {
+        "imported": imported,
+        "updated": updated,
+        "port_configs_applied": port_configs_applied
+    }
+    
+    if warnings:
+        result["warnings"] = warnings
+    
+    return result
